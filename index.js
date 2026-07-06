@@ -302,10 +302,18 @@ async function run() {
           return res.status(400).send({ message: "Email and auth user id are required" });
         }
 
-        const user = await userscollection.findOne({ email });
+        let user = await userscollection.findOne({ email });
 
-        if (!user || (user.authUserId && user.authUserId !== authUserId)) {
+        if (!user) {
           return res.status(401).send({ message: "Invalid auth user" });
+        }
+
+        if (!user.authUserId || user.authUserId !== authUserId) {
+          await userscollection.updateOne(
+            { email },
+            { $set: { authUserId, updatedAt: new Date().toISOString() } }
+          );
+          user = { ...user, authUserId };
         }
 
         res.send({ token: createToken(user) });
