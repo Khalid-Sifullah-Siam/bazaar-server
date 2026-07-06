@@ -3,21 +3,52 @@ const dotenv = require("dotenv");
 const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
+const Stripe = require("stripe");
+const jwt = require("jsonwebtoken");
 const { MongoClient, ObjectId, ServerApiVersion } = require("mongodb");
 dotenv.config({ path: path.join(__dirname, ".env") });
 const app = express();
 const port = process.env.PORT || 5000;
 const upload = multer();
+const stripeSecretKey =
+  process.env.STRIPE_SECRET_KEY ||
+  process.env["NEXT_PUBLIC_+STRIPE_SECRET_KEY"] ||
+  "";
+const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
+const jwtSecret = process.env.JWT_SECRET || process.env.BETTER_AUTH_SECRET || "bazaar-dev-jwt-secret";
+const sellerPlans = {
+  pro: {
+    name: "Pro",
+    price: 4,
+    features: "More visibility, priority review, seller insights",
+  },
+  max: {
+    name: "Max",
+    price: 14,
+    features: "Highest visibility, fastest review, advanced sales tracking",
+  },
+};
+const normalizeOrigin = (url) => (url || "").replace(/\/$/, "");
 const allowedOrigins = [
-  process.env.CLIENT_URL,
+  ...String(process.env.CLIENT_URL || "")
+    .split(",")
+    .map((url) => normalizeOrigin(url.trim())),
   "http://localhost:3000",
   "http://localhost:3001",
 ].filter(Boolean);
 
+const isAllowedOrigin = (origin) => {
+  const normalizedOrigin = normalizeOrigin(origin);
+
+  return (
+    allowedOrigins.includes(normalizedOrigin) ||
+    /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(normalizedOrigin)
+  );
+};
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin || isAllowedOrigin(origin)) {
       return callback(null, true);
     }
 
@@ -52,6 +83,63 @@ async function run() {
     const buyerPurchasesCollection = db.collection("buyerPurchases");
     const buyerPaymentsCollection = db.collection("buyerPayments");
     const productCategories = ["cloth", "medicine", "book", "fruits", "grocery"];
+
+    const createToken = (user) =>
+      jwt.sign(
+        {
+          email: user.email,
+          role: user.role || "buyer",
+          plan: user.plan || "free",
+        },
+        jwtSecret,
+        { expiresIn: "7d" }
+      );
+
+    const verifyToken = async (req, res, next) => {
+      try {
+        const authHeader = req.headers.authorization || "";
+        const token = authHeader.startsWith("Bearer ")
+          ? authHeader.slice(7)
+          : "";
+
+        if (!token) {
+          return res.status(401).send({ message: "Unauthorized request" });
+        }
+
+        const decoded = jwt.verify(token, jwtSecret);
+        const user = await userscollection.findOne({ email: decoded.email });
+
+        if (!user) {
+          return res.status(401).send({ message: "User not found" });
+        }
+
+        req.user = {
+          email: user.email,
+          role: user.role || "buyer",
+          plan: user.plan || "free",
+        };
+        next();
+      } catch {
+        res.status(401).send({ message: "Invalid or expired token" });
+      }
+    };
+
+    const requireRole = (...roles) => (req, res, next) => {
+      if (!roles.includes(req.user?.role)) {
+        return res.status(403).send({ message: "Forbidden route" });
+      }
+
+      next();
+    };
+
+    const requireSameEmail = (req, res, email) => {
+      if (req.user.role !== "admin" && req.user.email !== email) {
+        res.status(403).send({ message: "Forbidden user access" });
+        return false;
+      }
+
+      return true;
+    };
 
     await userscollection.updateMany(
       { role: { $exists: false } },
@@ -206,12 +294,38 @@ async function run() {
       }
     });
 
-    app.post("/products", async (req, res) => {
+    app.post("/auth/jwt", async (req, res) => {
+      try {
+        const { email, authUserId } = req.body;
+
+        if (!email || !authUserId) {
+          return res.status(400).send({ message: "Email and auth user id are required" });
+        }
+
+        const user = await userscollection.findOne({ email });
+
+        if (!user || (user.authUserId && user.authUserId !== authUserId)) {
+          return res.status(401).send({ message: "Invalid auth user" });
+        }
+
+        res.send({ token: createToken(user) });
+      } catch (error) {
+        res.status(500).send({
+          message: error.message || "JWT create failed",
+        });
+      }
+    });
+
+    app.post("/products", verifyToken, requireRole("seller"), async (req, res) => {
       try {
         const { name, category, quantity, price, image, sellerEmail } = req.body;
 
         if (!name || !category || !quantity || !price || !image || !sellerEmail) {
           return res.status(400).send({ message: "All product fields are required" });
+        }
+
+        if (req.user.email !== sellerEmail) {
+          return res.status(403).send({ message: "Forbidden seller access" });
         }
 
         if (!productCategories.includes(category)) {
@@ -260,12 +374,16 @@ async function run() {
       }
     });
 
-    app.get("/products/seller", async (req, res) => {
+    app.get("/products/seller", verifyToken, requireRole("seller"), async (req, res) => {
       try {
         const sellerEmail = req.query.email;
 
         if (!sellerEmail) {
           return res.status(400).send({ message: "Seller email is required" });
+        }
+
+        if (req.user.email !== sellerEmail) {
+          return res.status(403).send({ message: "Forbidden seller access" });
         }
 
         const products = await productsCollection
@@ -281,12 +399,16 @@ async function run() {
       }
     });
 
-    app.get("/products/seller/stats", async (req, res) => {
+    app.get("/products/seller/stats", verifyToken, requireRole("seller"), async (req, res) => {
       try {
         const sellerEmail = req.query.email;
 
         if (!sellerEmail) {
           return res.status(400).send({ message: "Seller email is required" });
+        }
+
+        if (req.user.email !== sellerEmail) {
+          return res.status(403).send({ message: "Forbidden seller access" });
         }
 
         const products = await productsCollection
@@ -313,12 +435,41 @@ async function run() {
       }
     });
 
-    app.get("/buyer/summary", async (req, res) => {
+    app.get("/products/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid product id" });
+        }
+
+        const product = await productsCollection.findOne({
+          _id: new ObjectId(id),
+          status: "approved",
+        });
+
+        if (!product) {
+          return res.status(404).send({ message: "Product not found" });
+        }
+
+        res.send(product);
+      } catch (error) {
+        res.status(500).send({
+          message: error.message || "Product fetch failed",
+        });
+      }
+    });
+
+    app.get("/buyer/summary", verifyToken, requireRole("buyer"), async (req, res) => {
       try {
         const email = req.query.email;
 
         if (!email) {
           return res.status(400).send({ message: "Buyer email is required" });
+        }
+
+        if (req.user.email !== email) {
+          return res.status(403).send({ message: "Forbidden buyer access" });
         }
 
         const purchases = await buyerPurchasesCollection.find({ buyerEmail: email }).toArray();
@@ -341,12 +492,16 @@ async function run() {
       }
     });
 
-    app.get("/buyer/products", async (req, res) => {
+    app.get("/buyer/products", verifyToken, requireRole("buyer"), async (req, res) => {
       try {
         const email = req.query.email;
 
         if (!email) {
           return res.status(400).send({ message: "Buyer email is required" });
+        }
+
+        if (req.user.email !== email) {
+          return res.status(403).send({ message: "Forbidden buyer access" });
         }
 
         const purchases = await buyerPurchasesCollection
@@ -362,12 +517,359 @@ async function run() {
       }
     });
 
-    app.get("/buyer/payments", async (req, res) => {
+    app.post("/checkout/sessions", verifyToken, requireRole("buyer"), async (req, res) => {
+      try {
+        const { productId, buyerEmail, quantity } = req.body;
+        const selectedQuantity = Number(quantity);
+
+        if (!stripe) {
+          return res.status(500).send({ message: "Stripe secret key is missing" });
+        }
+
+        if (!ObjectId.isValid(productId)) {
+          return res.status(400).send({ message: "Invalid product id" });
+        }
+
+        if (!buyerEmail) {
+          return res.status(400).send({ message: "Buyer email is required" });
+        }
+
+        if (req.user.email !== buyerEmail) {
+          return res.status(403).send({ message: "Forbidden buyer access" });
+        }
+
+        if (!Number.isInteger(selectedQuantity) || selectedQuantity < 1) {
+          return res.status(400).send({ message: "Quantity must be at least 1" });
+        }
+
+        const productObjectId = new ObjectId(productId);
+        const product = await productsCollection.findOne({
+          _id: productObjectId,
+          status: "approved",
+        });
+
+        if (!product) {
+          return res.status(404).send({ message: "Product not found" });
+        }
+
+        if (Number(product.quantity || 0) < selectedQuantity) {
+          return res.status(400).send({
+            message: `Only ${product.quantity || 0} item${product.quantity === 1 ? "" : "s"} available`,
+          });
+        }
+
+        const total = Number(product.price || 0) * selectedQuantity;
+        const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
+        const session = await stripe.checkout.sessions.create({
+          mode: "payment",
+          customer_email: buyerEmail,
+          line_items: [
+            {
+              quantity: selectedQuantity,
+              price_data: {
+                currency: "usd",
+                unit_amount: Math.round(Number(product.price || 0) * 100),
+                product_data: {
+                  name: product.name,
+                  images: product.image ? [product.image] : [],
+                },
+              },
+            },
+          ],
+          metadata: {
+            productId,
+            buyerEmail,
+            quantity: String(selectedQuantity),
+            total: String(total),
+          },
+          success_url: `${clientUrl}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${clientUrl}/checkout/cancel`,
+        });
+
+        res.send({ url: session.url });
+      } catch (error) {
+        res.status(500).send({
+          message: error.message || "Checkout failed",
+        });
+      }
+    });
+
+    app.post("/checkout/sessions/:sessionId/confirm", verifyToken, requireRole("buyer"), async (req, res) => {
+      try {
+        const { sessionId } = req.params;
+
+        if (!stripe) {
+          return res.status(500).send({ message: "Stripe secret key is missing" });
+        }
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (session.payment_status !== "paid") {
+          return res.status(400).send({ message: "Payment is not completed" });
+        }
+
+        const existingPayment = await buyerPaymentsCollection.findOne({
+          stripeSessionId: session.id,
+        });
+
+        if (existingPayment) {
+          return res.send({ message: "Payment already confirmed" });
+        }
+
+        const productId = session.metadata?.productId;
+        const buyerEmail = session.metadata?.buyerEmail;
+        const selectedQuantity = Number(session.metadata?.quantity || 0);
+
+        if (req.user.email !== buyerEmail) {
+          return res.status(403).send({ message: "Forbidden buyer access" });
+        }
+
+        if (!ObjectId.isValid(productId) || !buyerEmail || selectedQuantity < 1) {
+          return res.status(400).send({ message: "Invalid checkout metadata" });
+        }
+
+        const productObjectId = new ObjectId(productId);
+        const product = await productsCollection.findOne({
+          _id: productObjectId,
+          status: "approved",
+        });
+
+        if (!product) {
+          return res.status(404).send({ message: "Product not found" });
+        }
+
+        const total = Number(product.price || 0) * selectedQuantity;
+        const now = new Date().toISOString();
+        const stockUpdate = await productsCollection.updateOne(
+          {
+            _id: productObjectId,
+            status: "approved",
+            quantity: { $gte: selectedQuantity },
+          },
+          {
+            $inc: {
+              quantity: -selectedQuantity,
+              soldCount: selectedQuantity,
+              revenue: total,
+            },
+            $set: { updatedAt: now },
+          }
+        );
+
+        if (!stockUpdate.modifiedCount) {
+          return res.status(400).send({ message: "Not enough stock available" });
+        }
+
+        const purchase = {
+          productId,
+          name: product.name,
+          category: product.category,
+          image: product.image,
+          price: Number(product.price || 0),
+          quantity: selectedQuantity,
+          total,
+          buyerEmail,
+          sellerEmail: product.sellerEmail,
+          stripeSessionId: session.id,
+          createdAt: now,
+        };
+        const payment = {
+          productId,
+          productName: product.name,
+          buyerEmail,
+          sellerEmail: product.sellerEmail,
+          amount: total,
+          quantity: selectedQuantity,
+          status: "paid",
+          stripeSessionId: session.id,
+          createdAt: now,
+        };
+
+        const purchaseResult = await buyerPurchasesCollection.insertOne(purchase);
+        await buyerPaymentsCollection.insertOne(payment);
+
+        res.send({ ...purchase, _id: purchaseResult.insertedId });
+      } catch (error) {
+        res.status(500).send({
+          message: error.message || "Payment confirmation failed",
+        });
+      }
+    });
+
+    app.post("/seller-plans/checkout", verifyToken, requireRole("seller"), async (req, res) => {
+      try {
+        const { sellerEmail, plan } = req.body;
+        const selectedPlan = sellerPlans[plan];
+
+        if (!stripe) {
+          return res.status(500).send({ message: "Stripe secret key is missing" });
+        }
+
+        if (!sellerEmail) {
+          return res.status(400).send({ message: "Seller email is required" });
+        }
+
+        if (req.user.email !== sellerEmail) {
+          return res.status(403).send({ message: "Forbidden seller access" });
+        }
+
+        if (!selectedPlan) {
+          return res.status(400).send({ message: "Invalid seller plan" });
+        }
+
+        const seller = await userscollection.findOne({ email: sellerEmail });
+
+        if (!seller || seller.role !== "seller") {
+          return res.status(403).send({ message: "Only sellers can upgrade plans" });
+        }
+
+        const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
+        const session = await stripe.checkout.sessions.create({
+          mode: "payment",
+          customer_email: sellerEmail,
+          line_items: [
+            {
+              quantity: 1,
+              price_data: {
+                currency: "usd",
+                unit_amount: selectedPlan.price * 100,
+                product_data: {
+                  name: `${selectedPlan.name} Seller Plan`,
+                  description: selectedPlan.features,
+                },
+              },
+            },
+          ],
+          metadata: {
+            type: "seller-plan",
+            sellerEmail,
+            plan,
+          },
+          success_url: `${clientUrl}/plans/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${clientUrl}/plans/cancel`,
+        });
+
+        res.send({ url: session.url });
+      } catch (error) {
+        res.status(500).send({
+          message: error.message || "Plan checkout failed",
+        });
+      }
+    });
+
+    app.post("/seller-plans/checkout/:sessionId/confirm", verifyToken, requireRole("seller"), async (req, res) => {
+      try {
+        const { sessionId } = req.params;
+
+        if (!stripe) {
+          return res.status(500).send({ message: "Stripe secret key is missing" });
+        }
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (session.payment_status !== "paid") {
+          return res.status(400).send({ message: "Payment is not completed" });
+        }
+
+        if (session.metadata?.type !== "seller-plan") {
+          return res.status(400).send({ message: "Invalid plan checkout session" });
+        }
+
+        const sellerEmail = session.metadata?.sellerEmail;
+        const plan = session.metadata?.plan;
+        const selectedPlan = sellerPlans[plan];
+
+        if (!sellerEmail || !selectedPlan) {
+          return res.status(400).send({ message: "Invalid plan checkout metadata" });
+        }
+
+        if (req.user.email !== sellerEmail) {
+          return res.status(403).send({ message: "Forbidden seller access" });
+        }
+
+        const existingPayment = await buyerPaymentsCollection.findOne({
+          stripeSessionId: session.id,
+        });
+
+        if (existingPayment) {
+          return res.send({ message: "Plan already confirmed", plan });
+        }
+
+        const updateFields = {
+          plan,
+          planPrice: selectedPlan.price,
+          planUpdatedAt: new Date().toISOString(),
+        };
+
+        const result = await userscollection.updateOne(
+          { email: sellerEmail, role: "seller" },
+          { $set: updateFields }
+        );
+
+        if (!result.matchedCount) {
+          return res.status(404).send({ message: "Seller not found" });
+        }
+
+        await authUsersCollection.updateOne(
+          { email: sellerEmail },
+          { $set: updateFields }
+        );
+
+        await buyerPaymentsCollection.insertOne({
+          productName: `${selectedPlan.name} Seller Plan`,
+          sellerEmail,
+          buyerEmail: sellerEmail,
+          amount: selectedPlan.price,
+          status: "paid",
+          type: "seller-plan",
+          plan,
+          stripeSessionId: session.id,
+          createdAt: updateFields.planUpdatedAt,
+        });
+
+        res.send({ message: "Plan updated", plan });
+      } catch (error) {
+        res.status(500).send({
+          message: error.message || "Plan confirmation failed",
+        });
+      }
+    });
+
+    app.get("/seller-plans/history", verifyToken, requireRole("seller"), async (req, res) => {
+      try {
+        const email = req.query.email;
+
+        if (!email) {
+          return res.status(400).send({ message: "Seller email is required" });
+        }
+
+        if (req.user.email !== email) {
+          return res.status(403).send({ message: "Forbidden seller access" });
+        }
+
+        const history = await buyerPaymentsCollection
+          .find({ sellerEmail: email, type: "seller-plan" })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.send(history);
+      } catch (error) {
+        res.status(500).send({
+          message: error.message || "Plan history fetch failed",
+        });
+      }
+    });
+
+    app.get("/buyer/payments", verifyToken, requireRole("buyer"), async (req, res) => {
       try {
         const email = req.query.email;
 
         if (!email) {
           return res.status(400).send({ message: "Buyer email is required" });
+        }
+
+        if (req.user.email !== email) {
+          return res.status(403).send({ message: "Forbidden buyer access" });
         }
 
         const payments = await buyerPaymentsCollection
@@ -383,7 +885,7 @@ async function run() {
       }
     });
 
-    app.get("/admin/overview", async (req, res) => {
+    app.get("/admin/overview", verifyToken, requireRole("admin"), async (req, res) => {
       try {
         const totalUsers = await userscollection.countDocuments();
         const requestedProducts = await productsCollection.countDocuments({ status: "pending" });
@@ -396,7 +898,7 @@ async function run() {
       }
     });
 
-    app.get("/admin/products", async (req, res) => {
+    app.get("/admin/products", verifyToken, requireRole("admin"), async (req, res) => {
       try {
         const products = await productsCollection
           .find({})
@@ -411,7 +913,7 @@ async function run() {
       }
     });
 
-    app.patch("/admin/products/:id/status", async (req, res) => {
+    app.patch("/admin/products/:id/status", verifyToken, requireRole("admin"), async (req, res) => {
       try {
         const { id } = req.params;
         const { status } = req.body;
@@ -438,7 +940,7 @@ async function run() {
       }
     });
 
-    app.delete("/admin/products/:id", async (req, res) => {
+    app.delete("/admin/products/:id", verifyToken, requireRole("admin"), async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -460,7 +962,7 @@ async function run() {
       }
     });
 
-    app.get("/admin/users", async (req, res) => {
+    app.get("/admin/users", verifyToken, requireRole("admin"), async (req, res) => {
       try {
         const users = await userscollection
           .find({})
@@ -475,7 +977,7 @@ async function run() {
       }
     });
 
-    app.patch("/admin/users/:email", async (req, res) => {
+    app.patch("/admin/users/:email", verifyToken, requireRole("admin"), async (req, res) => {
       try {
         const email = decodeURIComponent(req.params.email);
         const { role, accountStatus } = req.body;
@@ -516,7 +1018,7 @@ async function run() {
       }
     });
 
-    app.get("/admin/payments", async (req, res) => {
+    app.get("/admin/payments", verifyToken, requireRole("admin"), async (req, res) => {
       try {
         const payments = await buyerPaymentsCollection
           .find({})
@@ -531,7 +1033,7 @@ async function run() {
       }
     });
 
-    app.put("/products/:id", async (req, res) => {
+    app.put("/products/:id", verifyToken, requireRole("seller"), async (req, res) => {
       try {
         const { id } = req.params;
         const { name, category, quantity, price, image, sellerEmail } = req.body;
@@ -542,6 +1044,10 @@ async function run() {
 
         if (!name || !category || !quantity || !price || !image || !sellerEmail) {
           return res.status(400).send({ message: "All product fields are required" });
+        }
+
+        if (req.user.email !== sellerEmail) {
+          return res.status(403).send({ message: "Forbidden seller access" });
         }
 
         if (!productCategories.includes(category)) {
@@ -580,7 +1086,7 @@ async function run() {
       }
     });
 
-    app.delete("/products/:id", async (req, res) => {
+    app.delete("/products/:id", verifyToken, requireRole("seller"), async (req, res) => {
       try {
         const { id } = req.params;
         const sellerEmail = req.query.sellerEmail;
@@ -591,6 +1097,10 @@ async function run() {
 
         if (!sellerEmail) {
           return res.status(400).send({ message: "Seller email is required" });
+        }
+
+        if (req.user.email !== sellerEmail) {
+          return res.status(403).send({ message: "Forbidden seller access" });
         }
 
         const result = await productsCollection.deleteOne({
@@ -621,6 +1131,11 @@ run().catch(console.dir);
 app.get("/", (req, res) => {
   res.send("Bazaar Server");
 });
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}
+
+module.exports = app;
