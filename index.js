@@ -1134,16 +1134,24 @@ async function run() {
 
   }
 }
-run().catch(console.dir);
+const ready = run().catch((error) => {
+  console.error(error);
+  throw error;
+});
 
 app.get("/", (req, res) => {
   res.send("Bazaar Server");
 });
 
 if (require.main === module) {
-  app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+  ready.then(() => {
+    app.listen(port, () => {
+      console.log(`Server running on port ${port}`);
+    });
   });
 }
 
-module.exports = app;
+module.exports = async (req, res) => {
+  await ready;
+  return app(req, res);
+};
